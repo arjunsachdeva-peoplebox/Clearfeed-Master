@@ -8,6 +8,13 @@ const CLEARFEED_TOKEN = process.env.CLEARFEED_API_TOKEN;
 const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_SERVICE_KEY = process.env.SUPABASE_SERVICE_KEY;
 const GROQ_API_KEY = process.env.GROQ_API_KEY;
+// Set GEMINI_API_KEY on Railway to use Gemini (free Flash tier, 1M context); unset to fall
+// back to Groq. GEMINI_MODEL defaults to gemini-2.5-flash (free). Flash-lite = higher RPM.
+const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
+const GEMINI_MODEL = process.env.GEMINI_MODEL || 'gemini-2.5-flash';
+const AI_PROVIDER = GEMINI_API_KEY ? 'gemini' : 'groq';
+// Pace between AI calls. Gemini free tier is ~10-15 RPM, so 6s is safe; Groq tolerates 4s.
+const AI_DELAY = GEMINI_API_KEY ? 6000 : 4000;
 
 app.use(cors({ origin: '*' }));
 app.use(express.json());
@@ -41,10 +48,11 @@ async function clearfeedFetch(path) {
   return res.json();
 }
 
-// ── GROQ AI PROCESSING ──
+// ── AI PROCESSING (Gemini-primary, Groq fallback) ──
 async function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
 
-async function groqWithRetry(prompt, retries = 6) {
+// Both providers normalise to { text, tokenCount }.
+async function groqComplete(prompt, { maxTokens = 400, json = false } = {}, retries = 6) {
   for (let i = 0; i < retries; i++) {
     const res = await fetch('https://api.groq.com/openai/v1/chat/completions', {
       method: 'POST',
@@ -53,7 +61,8 @@ async function groqWithRetry(prompt, retries = 6) {
         model: 'llama-3.1-8b-instant', // higher rate limits than 70b on free tier
         messages: [{ role: 'user', content: prompt }],
         temperature: 0.1,
-        max_tokens: 400,
+        max_tokens: maxTokens,
+        ...(json ? { response_format: { type: 'json_object' } } : {}),
       }),
     });
     if (res.status === 429) {
@@ -62,22 +71,75 @@ async function groqWithRetry(prompt, retries = 6) {
       let wait = (i + 1) * 8000;
       const m = body.match(/try again in ([\d.]+)(ms|s)/);
       if (m) wait = parseFloat(m[1]) * (m[2] === 's' ? 1000 : 1) + 1500;
-      console.log(`  Rate limited, waiting ${Math.round(wait)}ms...`);
+      console.log(`  Groq rate limited, waiting ${Math.round(wait)}ms...`);
       await sleep(Math.min(wait, 65000));
       continue;
     }
     if (!res.ok) throw new Error(`Groq API failed: ${res.status} ${await res.text()}`);
-    return res.json();
+    const data = await res.json();
+    return { text: data.choices?.[0]?.message?.content || '', tokenCount: data.usage?.total_tokens || 0 };
   }
   throw new Error('Groq API failed after retries');
 }
 
+async function geminiComplete(prompt, { maxTokens = 400, json = false } = {}, retries = 6) {
+  const url = `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent?key=${GEMINI_API_KEY}`;
+  for (let i = 0; i < retries; i++) {
+    const res = await fetch(url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        contents: [{ parts: [{ text: prompt }] }],
+        generationConfig: {
+          temperature: 0.1,
+          maxOutputTokens: maxTokens,
+          // Disable "thinking" — these are extraction tasks, and thinking burns output
+          // tokens (can truncate the JSON) and free-tier quota for no quality gain.
+          thinkingConfig: { thinkingBudget: 0 },
+          ...(json ? { responseMimeType: 'application/json' } : {}),
+        },
+      }),
+    });
+    if (res.status === 429 || res.status === 503) {
+      const body = await res.text();
+      let wait = (i + 1) * 8000;
+      const m = body.match(/"retryDelay":\s*"([\d.]+)s"/);
+      if (m) wait = parseFloat(m[1]) * 1000 + 1500;
+      console.log(`  Gemini ${res.status}, waiting ${Math.round(wait)}ms...`);
+      await sleep(Math.min(wait, 65000));
+      continue;
+    }
+    if (!res.ok) throw new Error(`Gemini API failed: ${res.status} ${await res.text()}`);
+    const data = await res.json();
+    const text = (data.candidates?.[0]?.content?.parts || []).map(p => p.text || '').join('');
+    return { text, tokenCount: data.usageMetadata?.totalTokenCount || 0 };
+  }
+  throw new Error('Gemini API failed after retries');
+}
+
+// Unified entry point. Uses Gemini when GEMINI_API_KEY is set, else Groq.
+// Falls back to Groq if a Gemini call ultimately fails and Groq is configured.
+async function aiComplete(prompt, opts = {}) {
+  if (GEMINI_API_KEY) {
+    try {
+      return await geminiComplete(prompt, opts);
+    } catch (e) {
+      if (!GROQ_API_KEY) throw e;
+      console.warn(`  Gemini failed (${e.message}); falling back to Groq.`);
+      return await groqComplete(prompt, opts);
+    }
+  }
+  return await groqComplete(prompt, opts);
+}
+
 async function analyseTicket(ticket, messages) {
+  // Gemini's 1M context lets us send the full thread; Groq's tight TPM needs truncation.
+  const perMsg = GEMINI_API_KEY ? 4000 : 600;
+  const maxConv = GEMINI_API_KEY ? 30000 : 3000;
   let conversation = messages
-    .map(m => `[${m.is_responder ? 'AGENT' : 'CUSTOMER'}]: ${(m.text || '').slice(0, 600)}`)
+    .map(m => `[${m.is_responder ? 'AGENT' : 'CUSTOMER'}]: ${(m.text || '').slice(0, perMsg)}`)
     .join('\n');
-  // Cap total context to ~3000 chars (~750 tokens) to stay under Groq free-tier TPM
-  if (conversation.length > 3000) conversation = conversation.slice(0, 3000) + '\n...(truncated)';
+  if (conversation.length > maxConv) conversation = conversation.slice(0, maxConv) + '\n...(truncated)';
 
   const prompt = `You are analysing a B2B SaaS support ticket for Peoplebox (an HR performance management platform). 
 
@@ -109,9 +171,7 @@ Respond with ONLY valid JSON (no markdown, no explanation):
   "prevention_note": "one concrete sentence on what change would stop this ticket from recurring"
 }`;
 
-  const data = await groqWithRetry(prompt);
-  const text = data.choices?.[0]?.message?.content || '{}';
-  const tokenCount = data.usage?.total_tokens || 0;
+  const { text, tokenCount } = await aiComplete(prompt, { maxTokens: 500, json: true });
 
   try {
     const cleaned = text.replace(/```json\n?/g, '').replace(/```\n?/g, '').trim();
@@ -287,7 +347,7 @@ async function runSync(options = {}) {
           await upsertAnalysis(ticket.id, analysis, tokenCount);
           if (analysis) ticketsAnalysed++;
           totalTokens += tokenCount;
-          await sleep(4000); // 4s delay = ~15 tickets/min, safe for Groq 12K TPM
+          await sleep(AI_DELAY);
         }
 
         if (ticketsSynced % 10 === 0) {
@@ -318,7 +378,11 @@ async function runSync(options = {}) {
 }
 
 // ── ROUTES ──
-app.get('/health', (req, res) => res.json({ status: 'ok' }));
+app.get('/health', (req, res) => res.json({
+  status: 'ok',
+  ai_provider: AI_PROVIDER,
+  model: AI_PROVIDER === 'gemini' ? GEMINI_MODEL : 'llama-3.1-8b-instant',
+}));
 
 // Proxy routes (keep existing ones working)
 app.get('/tickets', async (req, res) => {
@@ -381,7 +445,7 @@ app.post('/analyse', async (req, res) => {
             await upsertAnalysis(ticket.id, analysis, tokenCount);
             if (analysis) processed++;
             if (processed % 10 === 0) console.log(`  🤖 ${processed} tickets analysed`);
-            await sleep(4000); // respect Groq 12K TPM free tier
+            await sleep(AI_DELAY); // pace AI calls for the active provider
           } catch (err) {
             console.error(`  ❌ Analysis failed for ${ticket.id}: ${err.message}`);
             // If a ticket keeps failing it would loop forever (stays in view).
@@ -446,9 +510,8 @@ QUESTION: ${question}
 TICKET DATA (${tickets.length} analysed tickets):
 ${context}`;
 
-    const data = await groqWithRetry(prompt);
-    const answer = data.choices?.[0]?.message?.content || 'No answer generated.';
-    res.json({ answer, count: tickets.length, tokensUsed: data.usage?.total_tokens || 0 });
+    const { text: answer, tokenCount } = await aiComplete(prompt, { maxTokens: 800, json: false });
+    res.json({ answer: answer || 'No answer generated.', count: tickets.length, tokensUsed: tokenCount });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -487,10 +550,10 @@ Summary: ${(a.summary || '').slice(0, 300)}
 Respond with ONLY valid JSON:
 {"root_cause_category":"onboarding_setup|feature_discovery|workflow_confusion|bug_defect|access_provisioning|billing|knowledge_gap|integration_config|other","eliminable":true or false,"elimination_lever":"product_fix|ux_improvement|onboarding|self_service_kb|automation|engineering_fix|none","fix_owner":"product|engineering|design|docs_support|ops|none","prevention_note":"one concrete sentence on what change would stop this ticket recurring"}`;
           try {
-            const data = await groqWithRetry(prompt);
-            const text = (data.choices?.[0]?.message?.content || '{}').replace(/```json\n?/g, '').replace(/```\n?/g, '').trim();
+            const { text } = await aiComplete(prompt, { maxTokens: 300, json: true });
+            const cleaned = (text || '{}').replace(/```json\n?/g, '').replace(/```\n?/g, '').trim();
             let rca;
-            try { rca = JSON.parse(text); } catch { rca = { root_cause_category: 'other' }; }
+            try { rca = JSON.parse(cleaned); } catch { rca = { root_cause_category: 'other' }; }
             await supabase(`/ticket_analysis?ticket_id=eq.${t.id}`, 'PATCH', {
               root_cause_category: rca.root_cause_category || 'other',
               eliminable: typeof rca.eliminable === 'boolean' ? rca.eliminable : null,
@@ -500,7 +563,7 @@ Respond with ONLY valid JSON:
             });
             processed++;
             if (processed % 10 === 0) console.log(`  🧩 ${processed} tickets enriched`);
-            await sleep(3500);
+            await sleep(AI_DELAY);
           } catch (err) {
             console.error(`  ❌ Enrich failed for ${t.id}: ${err.message}`);
             // Mark as 'other' so it leaves the IS NULL set and we don't loop forever.
@@ -552,8 +615,9 @@ ${sigLines}
 Respond with ONLY a valid JSON array (no markdown):
 [{"label":"short cluster name (max 6 words)","root_cause_category":"onboarding_setup|feature_discovery|workflow_confusion|bug_defect|access_provisioning|billing|knowledge_gap|integration_config|other","description":"one sentence on what tickets in this cluster are about","suggested_fix":"the single change that would most reduce these tickets","fix_owner":"product|engineering|design|docs_support|ops"}]`;
 
-      const taxData = await groqWithRetry(taxonomyPrompt);
-      const taxText = (taxData.choices?.[0]?.message?.content || '[]').replace(/```json\n?/g, '').replace(/```\n?/g, '').trim();
+      // json mode off: output is a JSON *array*, but Groq's json_object mode requires an object.
+      const { text: taxRaw } = await aiComplete(taxonomyPrompt, { maxTokens: 1800, json: false });
+      const taxText = (taxRaw || '[]').replace(/```json\n?/g, '').replace(/```\n?/g, '').trim();
       let clusters;
       try { clusters = JSON.parse(taxText); } catch { console.error('  Failed to parse taxonomy JSON'); clusterRunning = false; return; }
       if (!Array.isArray(clusters) || !clusters.length) { console.error('  Empty taxonomy'); clusterRunning = false; return; }
@@ -602,9 +666,8 @@ Respond with ONLY a valid JSON object mapping ticket id (without the CF- prefix)
 
         let map = {};
         try {
-          const aData = await groqWithRetry(assignPrompt);
-          const aText = (aData.choices?.[0]?.message?.content || '{}').replace(/```json\n?/g, '').replace(/```\n?/g, '').trim();
-          map = JSON.parse(aText);
+          const { text: aText } = await aiComplete(assignPrompt, { maxTokens: 600, json: true });
+          map = JSON.parse((aText || '{}').replace(/```json\n?/g, '').replace(/```\n?/g, '').trim());
         } catch (err) {
           console.error(`  ❌ Assign batch failed: ${err.message}`);
         }
@@ -616,7 +679,7 @@ Respond with ONLY a valid JSON object mapping ticket id (without the CF- prefix)
           assigned++;
         }
         if (assigned % 30 === 0) console.log(`  🧭 ${assigned} tickets assigned`);
-        await sleep(3500);
+        await sleep(AI_DELAY);
       }
       console.log(`\n✅ Clustering complete. ${clusterRows.length} clusters, ${assigned} tickets assigned.`);
     } catch (err) {
@@ -637,4 +700,4 @@ app.get('/sync/status', async (req, res) => {
   }
 });
 
-app.listen(PORT, () => console.log(`ClearFeed sync service running on port ${PORT}`));
+app.listen(PORT, () => console.log(`ClearFeed sync service running on port ${PORT} · AI provider: ${AI_PROVIDER}${AI_PROVIDER === 'gemini' ? ' (' + GEMINI_MODEL + ')' : ''}`));
