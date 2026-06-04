@@ -51,6 +51,12 @@ async function clearfeedFetch(path) {
 // ── AI PROCESSING (Gemini-primary, Groq fallback) ──
 async function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
 
+// Signals a rate/quota limit that won't recover within this run (e.g. Gemini's daily cap),
+// so batch jobs can pause cleanly and resume later instead of churning or falling back.
+class RateLimitError extends Error {
+  constructor(message) { super(message); this.name = 'RateLimitError'; this.rateLimited = true; }
+}
+
 // Both providers normalise to { text, tokenCount }.
 async function groqComplete(prompt, { maxTokens = 400, json = false } = {}, retries = 6) {
   for (let i = 0; i < retries; i++) {
@@ -102,6 +108,11 @@ async function geminiComplete(prompt, { maxTokens = 400, json = false } = {}, re
     });
     if (res.status === 429 || res.status === 503) {
       const body = await res.text();
+      // A daily (requests/day) quota won't recover within this run — surface it so batch
+      // jobs can pause cleanly rather than burn minutes retrying every remaining ticket.
+      if (res.status === 429 && /per\s*day|perday|daily|PerDay/i.test(body)) {
+        throw new RateLimitError('Gemini daily quota (requests/day) exhausted');
+      }
       let wait = (i + 1) * 8000;
       const m = body.match(/"retryDelay":\s*"([\d.]+)s"/);
       if (m) wait = parseFloat(m[1]) * 1000 + 1500;
@@ -114,25 +125,29 @@ async function geminiComplete(prompt, { maxTokens = 400, json = false } = {}, re
     const text = (data.candidates?.[0]?.content?.parts || []).map(p => p.text || '').join('');
     return { text, tokenCount: data.usageMetadata?.totalTokenCount || 0 };
   }
-  throw new Error('Gemini API failed after retries');
+  throw new RateLimitError('Gemini rate-limited after retries');
 }
 
 // Unified entry point. Uses Gemini when GEMINI_API_KEY is set, else Groq.
-// Falls back to Groq if a Gemini call ultimately fails and Groq is configured.
+// Falls back to Groq if a Gemini call fails and Groq is configured — UNLESS the caller
+// passes pauseOnRateLimit and the failure is a rate/quota limit, in which case the error
+// is propagated so a batch job can stop cleanly and resume after the quota resets.
 async function aiComplete(prompt, opts = {}) {
+  const { pauseOnRateLimit = false, ...gen } = opts;
   if (GEMINI_API_KEY) {
     try {
-      return await geminiComplete(prompt, opts);
+      return await geminiComplete(prompt, gen);
     } catch (e) {
+      if (e.rateLimited && pauseOnRateLimit) throw e;
       if (!GROQ_API_KEY) throw e;
       console.warn(`  Gemini failed (${e.message}); falling back to Groq.`);
-      return await groqComplete(prompt, opts);
+      return await groqComplete(prompt, gen);
     }
   }
-  return await groqComplete(prompt, opts);
+  return await groqComplete(prompt, gen);
 }
 
-async function analyseTicket(ticket, messages) {
+async function analyseTicket(ticket, messages, opts = {}) {
   // Gemini's 1M context lets us send the full thread; Groq's tight TPM needs truncation.
   const perMsg = GEMINI_API_KEY ? 4000 : 600;
   const maxConv = GEMINI_API_KEY ? 30000 : 3000;
@@ -171,7 +186,7 @@ Respond with ONLY valid JSON (no markdown, no explanation):
   "prevention_note": "one concrete sentence on what change would stop this ticket from recurring"
 }`;
 
-  const { text, tokenCount } = await aiComplete(prompt, { maxTokens: 500, json: true });
+  const { text, tokenCount } = await aiComplete(prompt, { maxTokens: 500, json: true, ...opts });
 
   try {
     const cleaned = text.replace(/```json\n?/g, '').replace(/```\n?/g, '').trim();
@@ -427,6 +442,7 @@ app.post('/analyse', async (req, res) => {
   (async () => {
     console.log('\n🤖 Starting AI analysis of unanalysed tickets...');
     let processed = 0;
+    let paused = false;
 
     try {
       while (true) {
@@ -441,12 +457,15 @@ app.post('/analyse', async (req, res) => {
         for (const ticket of tickets) {
           try {
             const messages = await supabase(`/messages?ticket_id=eq.${ticket.id}&order=message_index.asc`, 'GET');
-            const { analysis, tokenCount } = await analyseTicket(ticket, messages || []);
+            // pauseOnRateLimit: if Gemini's daily quota is hit, stop cleanly (no Groq fallback,
+            // no placeholder) so re-running later resumes on Gemini for the remaining tickets.
+            const { analysis, tokenCount } = await analyseTicket(ticket, messages || [], { pauseOnRateLimit: true });
             await upsertAnalysis(ticket.id, analysis, tokenCount);
             if (analysis) processed++;
             if (processed % 10 === 0) console.log(`  🤖 ${processed} tickets analysed`);
             await sleep(AI_DELAY); // pace AI calls for the active provider
           } catch (err) {
+            if (err.rateLimited) { paused = true; break; }
             console.error(`  ❌ Analysis failed for ${ticket.id}: ${err.message}`);
             // If a ticket keeps failing it would loop forever (stays in view).
             // Write a minimal placeholder so it leaves the view.
@@ -455,8 +474,13 @@ app.post('/analyse', async (req, res) => {
             }
           }
         }
+        if (paused) break;
       }
-      console.log(`\n✅ AI analysis complete. ${processed} tickets analysed this run.`);
+      if (paused) {
+        console.log(`\n⏸ Analysis paused after ${processed} tickets this run — Gemini daily quota reached. Click "Run Analysis" again after it resets (midnight US Pacific) to continue on Gemini.`);
+      } else {
+        console.log(`\n✅ AI analysis complete. ${processed} tickets analysed this run.`);
+      }
     } catch (err) {
       console.error('Analysis run failed:', err.message);
     } finally {
@@ -666,9 +690,10 @@ Respond with ONLY a valid JSON object mapping ticket id (without the CF- prefix)
 
         let map = {};
         try {
-          const { text: aText } = await aiComplete(assignPrompt, { maxTokens: 600, json: true });
+          const { text: aText } = await aiComplete(assignPrompt, { maxTokens: 600, json: true, pauseOnRateLimit: true });
           map = JSON.parse((aText || '{}').replace(/```json\n?/g, '').replace(/```\n?/g, '').trim());
         } catch (err) {
+          if (err.rateLimited) { console.log('  ⏸ Clustering paused — Gemini daily quota reached. Run "Rebuild Clusters" again after it resets.'); break; }
           console.error(`  ❌ Assign batch failed: ${err.message}`);
         }
 
