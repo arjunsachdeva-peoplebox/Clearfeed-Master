@@ -8,15 +8,16 @@ const CLEARFEED_TOKEN = process.env.CLEARFEED_API_TOKEN;
 const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_SERVICE_KEY = process.env.SUPABASE_SERVICE_KEY;
 const GROQ_API_KEY = process.env.GROQ_API_KEY;
-// Set GEMINI_API_KEY on Railway to use Gemini (free Flash tier, 1M context); unset to fall
-// back to Groq. GEMINI_MODEL defaults to gemini-2.5-flash (free). Flash-lite = higher RPM.
+// Provider DEFAULTS TO GROQ. To use Gemini instead, set BOTH `AI_PROVIDER=gemini` and
+// `GEMINI_API_KEY` on Railway. (Gemini's free-tier RPM on this project is only 5, which is
+// too slow for bulk analysis, so Groq is the default.)
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
 const GEMINI_MODEL = process.env.GEMINI_MODEL || 'gemini-2.5-flash';
-const AI_PROVIDER = GEMINI_API_KEY ? 'gemini' : 'groq';
-// Pace between AI calls. This project's Gemini free-tier RPM limit is 5, so target ~4/min
-// = one call every 15s to stay safely under it (the per-minute 429 retry covers any
-// overshoot from request latency); Groq tolerates 4s.
-const AI_DELAY = GEMINI_API_KEY ? 15000 : 4000;
+const USE_GEMINI = process.env.AI_PROVIDER === 'gemini' && !!GEMINI_API_KEY;
+const AI_PROVIDER = USE_GEMINI ? 'gemini' : 'groq';
+// Pace between AI calls. Groq: 4s (~15/min, no daily cap). Gemini free tier here is capped
+// at 5 RPM, so 15s (~4/min) when enabled.
+const AI_DELAY = USE_GEMINI ? 15000 : 4000;
 
 app.use(cors({ origin: '*' }));
 app.use(express.json());
@@ -131,13 +132,13 @@ async function geminiComplete(prompt, { maxTokens = 400, json = false } = {}, re
   throw new RateLimitError('Gemini rate-limited after retries');
 }
 
-// Unified entry point. Uses Gemini when GEMINI_API_KEY is set, else Groq.
+// Unified entry point. Uses Gemini only when explicitly enabled (USE_GEMINI), else Groq.
 // Falls back to Groq if a Gemini call fails and Groq is configured — UNLESS the caller
 // passes pauseOnRateLimit and the failure is a rate/quota limit, in which case the error
 // is propagated so a batch job can stop cleanly and resume after the quota resets.
 async function aiComplete(prompt, opts = {}) {
   const { pauseOnRateLimit = false, ...gen } = opts;
-  if (GEMINI_API_KEY) {
+  if (USE_GEMINI) {
     try {
       return await geminiComplete(prompt, gen);
     } catch (e) {
@@ -152,8 +153,8 @@ async function aiComplete(prompt, opts = {}) {
 
 async function analyseTicket(ticket, messages, opts = {}) {
   // Gemini's 1M context lets us send the full thread; Groq's tight TPM needs truncation.
-  const perMsg = GEMINI_API_KEY ? 4000 : 600;
-  const maxConv = GEMINI_API_KEY ? 30000 : 3000;
+  const perMsg = USE_GEMINI ? 4000 : 600;
+  const maxConv = USE_GEMINI ? 30000 : 3000;
   let conversation = messages
     .map(m => `[${m.is_responder ? 'AGENT' : 'CUSTOMER'}]: ${(m.text || '').slice(0, perMsg)}`)
     .join('\n');
