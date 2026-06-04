@@ -89,6 +89,9 @@ Status: ${ticket.state}
 Conversation:
 ${conversation || '(no messages)'}
 
+The PRIMARY goal of this analysis is to REDUCE the number of future tickets. So beyond
+describing the ticket, judge what would have prevented it from ever being created.
+
 Respond with ONLY valid JSON (no markdown, no explanation):
 {
   "summary": "2-sentence summary of the issue and resolution",
@@ -98,7 +101,12 @@ Respond with ONLY valid JSON (no markdown, no explanation):
   "urgency_score": 1-5,
   "sentiment": "one of: positive | neutral | frustrated | urgent",
   "resolution_quality": "one of: fully_resolved | partially_resolved | unresolved | redirected",
-  "key_tags": ["2-5 short descriptive tags for this ticket"]
+  "key_tags": ["2-5 short descriptive tags for this ticket"],
+  "root_cause_category": "the underlying reason this ticket exists, one of: onboarding_setup | feature_discovery | workflow_confusion | bug_defect | access_provisioning | billing | knowledge_gap | integration_config | other",
+  "eliminable": true or false (true if a product/UX/onboarding/docs change could have PREVENTED this ticket; false if it inherently needs a human, e.g. a one-off account request),
+  "elimination_lever": "the single best way to prevent it, one of: product_fix | ux_improvement | onboarding | self_service_kb | automation | engineering_fix | none",
+  "fix_owner": "who should own the prevention, one of: product | engineering | design | docs_support | ops | none",
+  "prevention_note": "one concrete sentence on what change would stop this ticket from recurring"
 }`;
 
   const data = await groqWithRetry(prompt);
@@ -221,6 +229,11 @@ async function upsertAnalysis(ticketId, analysis, tokenCount) {
     sentiment: analysis.sentiment || null,
     resolution_quality: analysis.resolution_quality || null,
     key_tags: analysis.key_tags || [],
+    root_cause_category: analysis.root_cause_category || null,
+    eliminable: typeof analysis.eliminable === 'boolean' ? analysis.eliminable : null,
+    elimination_lever: analysis.elimination_lever || null,
+    fix_owner: analysis.fix_owner || null,
+    prevention_note: analysis.prevention_note || null,
     raw_ai_output: analysis,
     token_count: tokenCount,
     processed_at: new Date().toISOString(),
@@ -439,6 +452,179 @@ ${context}`;
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
+});
+
+// ── ROOT-CAUSE BACKFILL ──
+// Cheaply add root_cause_category / eliminable / fix_owner etc. to tickets that were
+// already analysed BEFORE these fields existed. Uses only title + summary + issue_type
+// (no raw conversation) to stay well under Groq's free-tier token limit. Idempotent:
+// only touches rows where root_cause_category IS NULL, so re-running resumes safely.
+let enrichRunning = false;
+app.post('/enrich-rca', async (req, res) => {
+  if (enrichRunning) return res.json({ message: 'Enrichment already running', alreadyRunning: true });
+  enrichRunning = true;
+  res.json({ message: 'Root-cause backfill started in background' });
+
+  (async () => {
+    console.log('\n🧩 Backfilling root-cause fields for already-analysed tickets...');
+    let processed = 0;
+    try {
+      while (true) {
+        const rows = await supabase(
+          `/tickets?select=id,title,collection_name,ticket_analysis!inner(summary,issue_type,product_areas,root_cause_category)&ticket_analysis.root_cause_category=is.null&limit=25`,
+          'GET'
+        );
+        if (!rows?.length) break;
+
+        for (const t of rows) {
+          const a = t.ticket_analysis || {};
+          const prompt = `You are reducing future support tickets for Peoplebox (HR performance SaaS). For the ticket below, decide what would have PREVENTED it.
+Title: ${(t.title || '').slice(0, 160)}
+Issue type: ${a.issue_type || 'unknown'}
+Product areas: ${(a.product_areas || []).join(', ') || 'unknown'}
+Summary: ${(a.summary || '').slice(0, 300)}
+
+Respond with ONLY valid JSON:
+{"root_cause_category":"onboarding_setup|feature_discovery|workflow_confusion|bug_defect|access_provisioning|billing|knowledge_gap|integration_config|other","eliminable":true or false,"elimination_lever":"product_fix|ux_improvement|onboarding|self_service_kb|automation|engineering_fix|none","fix_owner":"product|engineering|design|docs_support|ops|none","prevention_note":"one concrete sentence on what change would stop this ticket recurring"}`;
+          try {
+            const data = await groqWithRetry(prompt);
+            const text = (data.choices?.[0]?.message?.content || '{}').replace(/```json\n?/g, '').replace(/```\n?/g, '').trim();
+            let rca;
+            try { rca = JSON.parse(text); } catch { rca = { root_cause_category: 'other' }; }
+            await supabase(`/ticket_analysis?ticket_id=eq.${t.id}`, 'PATCH', {
+              root_cause_category: rca.root_cause_category || 'other',
+              eliminable: typeof rca.eliminable === 'boolean' ? rca.eliminable : null,
+              elimination_lever: rca.elimination_lever || null,
+              fix_owner: rca.fix_owner || null,
+              prevention_note: rca.prevention_note || null,
+            });
+            processed++;
+            if (processed % 10 === 0) console.log(`  🧩 ${processed} tickets enriched`);
+            await sleep(3500);
+          } catch (err) {
+            console.error(`  ❌ Enrich failed for ${t.id}: ${err.message}`);
+            // Mark as 'other' so it leaves the IS NULL set and we don't loop forever.
+            await supabase(`/ticket_analysis?ticket_id=eq.${t.id}`, 'PATCH', { root_cause_category: 'other' });
+          }
+        }
+      }
+      console.log(`\n✅ Root-cause backfill complete. ${processed} tickets enriched this run.`);
+    } catch (err) {
+      console.error('Enrichment run failed:', err.message);
+    } finally {
+      enrichRunning = false;
+    }
+  })().catch(e => { console.error(e); enrichRunning = false; });
+});
+
+// ── SEMANTIC CLUSTERING (two-pass, LLM-based) ──
+// Pass A: build a canonical cluster taxonomy from normalized issue statements.
+// Pass B: assign every analysed ticket to one of those clusters.
+// LLM-based (not Python BERTopic/HDBSCAN) because the Groq free tier has no embeddings
+// endpoint, and LLM semantic normalization is the top-performing approach for short,
+// noisy ticket text (FLAIRS-39, 2026). Stores results in ticket_clusters + ticket_analysis.cluster_id.
+let clusterRunning = false;
+app.post('/cluster', async (req, res) => {
+  if (clusterRunning) return res.json({ message: 'Clustering already running', alreadyRunning: true });
+  clusterRunning = true;
+  res.json({ message: 'Clustering started in background' });
+
+  (async () => {
+    console.log('\n🧭 Clustering: building taxonomy...');
+    try {
+      // ── PASS A: build taxonomy from a sample of analysed tickets ──
+      const sample = await supabase(
+        `/tickets?select=id,title,ticket_analysis!inner(summary,issue_type,product_areas,root_cause_category)&order=created_at.desc&limit=300`,
+        'GET'
+      );
+      if (!sample?.length) { console.log('  No analysed tickets to cluster.'); clusterRunning = false; return; }
+
+      const sigLines = sample.map(t => {
+        const a = t.ticket_analysis || {};
+        return `- ${(a.summary || t.title || '').slice(0, 140)} [${a.issue_type || ''}|${(a.product_areas || []).join('/')}|${a.root_cause_category || ''}]`;
+      }).join('\n');
+
+      const taxonomyPrompt = `You are grouping Peoplebox (HR performance SaaS) support tickets into recurring ISSUE CLUSTERS so the team can reduce ticket volume. Below are normalized issue statements. Produce 12-20 coherent, non-overlapping clusters that together cover the common patterns. Merge near-duplicates. Each cluster must be specific enough to act on.
+
+ISSUE STATEMENTS:
+${sigLines}
+
+Respond with ONLY a valid JSON array (no markdown):
+[{"label":"short cluster name (max 6 words)","root_cause_category":"onboarding_setup|feature_discovery|workflow_confusion|bug_defect|access_provisioning|billing|knowledge_gap|integration_config|other","description":"one sentence on what tickets in this cluster are about","suggested_fix":"the single change that would most reduce these tickets","fix_owner":"product|engineering|design|docs_support|ops"}]`;
+
+      const taxData = await groqWithRetry(taxonomyPrompt);
+      const taxText = (taxData.choices?.[0]?.message?.content || '[]').replace(/```json\n?/g, '').replace(/```\n?/g, '').trim();
+      let clusters;
+      try { clusters = JSON.parse(taxText); } catch { console.error('  Failed to parse taxonomy JSON'); clusterRunning = false; return; }
+      if (!Array.isArray(clusters) || !clusters.length) { console.error('  Empty taxonomy'); clusterRunning = false; return; }
+      clusters = clusters.slice(0, 25);
+
+      // Replace the clusters table and reset assignments
+      await supabase('/ticket_analysis?cluster_id=not.is.null', 'PATCH', { cluster_id: null });
+      await supabase('/ticket_clusters?id=gte.0', 'DELETE');
+      const clusterRows = clusters.map((c, i) => ({
+        id: i + 1,
+        label: (c.label || `Cluster ${i + 1}`).slice(0, 120),
+        root_cause_category: c.root_cause_category || 'other',
+        description: (c.description || '').slice(0, 400),
+        suggested_fix: (c.suggested_fix || '').slice(0, 400),
+        fix_owner: c.fix_owner || 'product',
+        updated_at: new Date().toISOString(),
+      }));
+      await supabase('/ticket_clusters', 'POST', clusterRows);
+      console.log(`  ✅ Built ${clusterRows.length} clusters. Assigning tickets...`);
+
+      const clusterList = clusterRows.map(c => `${c.id}: ${c.label}`).join('\n');
+
+      // ── PASS B: assign every analysed ticket without a cluster_id ──
+      let assigned = 0;
+      while (true) {
+        const batch = await supabase(
+          `/tickets?select=id,title,ticket_analysis!inner(summary,issue_type,cluster_id)&ticket_analysis.cluster_id=is.null&order=created_at.desc&limit=15`,
+          'GET'
+        );
+        if (!batch?.length) break;
+
+        const items = batch.map(t => {
+          const a = t.ticket_analysis || {};
+          return `CF-${t.id}: ${(a.summary || t.title || '').slice(0, 140)}`;
+        }).join('\n');
+
+        const assignPrompt = `Assign each ticket to the SINGLE best-matching cluster id from the list. If none fit, use 0.
+
+CLUSTERS:
+${clusterList}
+
+TICKETS:
+${items}
+
+Respond with ONLY a valid JSON object mapping ticket id (without the CF- prefix) to cluster id, e.g. {"123":4,"456":0}`;
+
+        let map = {};
+        try {
+          const aData = await groqWithRetry(assignPrompt);
+          const aText = (aData.choices?.[0]?.message?.content || '{}').replace(/```json\n?/g, '').replace(/```\n?/g, '').trim();
+          map = JSON.parse(aText);
+        } catch (err) {
+          console.error(`  ❌ Assign batch failed: ${err.message}`);
+        }
+
+        for (const t of batch) {
+          const cid = parseInt(map[t.id] ?? map[String(t.id)] ?? 0) || 0;
+          // Use 0 (no fit) → store as null but mark processed via cluster_id = 0 sentinel.
+          await supabase(`/ticket_analysis?ticket_id=eq.${t.id}`, 'PATCH', { cluster_id: cid > 0 ? cid : 0 });
+          assigned++;
+        }
+        if (assigned % 30 === 0) console.log(`  🧭 ${assigned} tickets assigned`);
+        await sleep(3500);
+      }
+      console.log(`\n✅ Clustering complete. ${clusterRows.length} clusters, ${assigned} tickets assigned.`);
+    } catch (err) {
+      console.error('Clustering run failed:', err.message);
+    } finally {
+      clusterRunning = false;
+    }
+  })().catch(e => { console.error(e); clusterRunning = false; });
 });
 
 // Sync status
