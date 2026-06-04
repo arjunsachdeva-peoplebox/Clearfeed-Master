@@ -41,7 +41,33 @@ async function clearfeedFetch(path) {
   return res.json();
 }
 
-// ── GEMINI AI PROCESSING ──
+// ── GROQ AI PROCESSING ──
+async function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
+
+async function groqWithRetry(prompt, retries = 3) {
+  for (let i = 0; i < retries; i++) {
+    const res = await fetch('https://api.groq.com/openai/v1/chat/completions', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${GROQ_API_KEY}` },
+      body: JSON.stringify({
+        model: 'llama-3.3-70b-versatile',
+        messages: [{ role: 'user', content: prompt }],
+        temperature: 0.1,
+        max_tokens: 512,
+      }),
+    });
+    if (res.status === 429) {
+      const wait = (i + 1) * 15000; // 15s, 30s, 45s
+      console.log(`  Rate limited, waiting ${wait/1000}s...`);
+      await sleep(wait);
+      continue;
+    }
+    if (!res.ok) throw new Error(`Groq API failed: ${res.status} ${await res.text()}`);
+    return res.json();
+  }
+  throw new Error('Groq API failed after retries');
+}
+
 async function analyseTicket(ticket, messages) {
   const conversation = messages
     .map(m => `[${m.is_responder ? 'AGENT' : 'CUSTOMER'}]: ${m.text}`)
@@ -69,22 +95,7 @@ Respond with ONLY valid JSON (no markdown, no explanation):
   "key_tags": ["2-5 short descriptive tags for this ticket"]
 }`;
 
-  const res = await fetch('https://api.groq.com/openai/v1/chat/completions', {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      'Authorization': `Bearer ${GROQ_API_KEY}`,
-    },
-    body: JSON.stringify({
-      model: 'llama-3.3-70b-versatile',
-      messages: [{ role: 'user', content: prompt }],
-      temperature: 0.1,
-      max_tokens: 512,
-    }),
-  });
-
-  if (!res.ok) throw new Error(`Groq API failed: ${res.status} ${await res.text()}`);
-  const data = await res.json();
+  const data = await groqWithRetry(prompt);
   const text = data.choices?.[0]?.message?.content || '{}';
   const tokenCount = data.usage?.total_tokens || 0;
 
@@ -257,7 +268,7 @@ async function runSync(options = {}) {
           await upsertAnalysis(ticket.id, analysis, tokenCount);
           if (analysis) ticketsAnalysed++;
           totalTokens += tokenCount;
-          await new Promise(r => setTimeout(r, 200)); // rate limit
+          await sleep(4000); // 4s delay = ~15 tickets/min, safe for Groq 12K TPM
         }
 
         if (ticketsSynced % 10 === 0) {
@@ -315,6 +326,42 @@ app.post('/sync', async (req, res) => {
   const { days = 180, skipAI = false } = req.body || {};
   res.json({ message: 'Sync started in background', days });
   runSync({ daysBack: parseInt(days), skipAI }).catch(console.error);
+});
+
+// Analyse-only: process tickets that don't have AI analysis yet
+app.post('/analyse', async (req, res) => {
+  res.json({ message: 'AI analysis started in background' });
+
+  (async () => {
+    console.log('\n🤖 Starting AI analysis of unanalysed tickets...');
+    let processed = 0;
+    let offset = 0;
+    const batchSize = 20;
+
+    while (true) {
+      // fetch unanalysed tickets with their messages
+      const tickets = await supabase(
+        `/tickets?select=id,title,state,priority,collection_name&id=not.in.(select ticket_id from ticket_analysis)&order=created_at.asc&limit=${batchSize}&offset=${offset}`,
+        'GET'
+      );
+      if (!tickets?.length) break;
+
+      for (const ticket of tickets) {
+        try {
+          const messages = await supabase(`/messages?ticket_id=eq.${ticket.id}&order=message_index.asc`, 'GET');
+          const { analysis, tokenCount } = await analyseTicket(ticket, messages || []);
+          await upsertAnalysis(ticket.id, analysis, tokenCount);
+          if (analysis) processed++;
+          if (processed % 10 === 0) console.log(`  🤖 ${processed} tickets analysed`);
+          await sleep(4000);
+        } catch (err) {
+          console.error(`  ❌ Analysis failed for ${ticket.id}: ${err.message}`);
+        }
+      }
+      offset += batchSize;
+    }
+    console.log(`\n✅ AI analysis complete. ${processed} tickets analysed.`);
+  })().catch(console.error);
 });
 
 // Sync status
