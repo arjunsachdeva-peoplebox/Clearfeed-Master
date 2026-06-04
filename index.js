@@ -44,22 +44,26 @@ async function clearfeedFetch(path) {
 // ── GROQ AI PROCESSING ──
 async function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
 
-async function groqWithRetry(prompt, retries = 3) {
+async function groqWithRetry(prompt, retries = 6) {
   for (let i = 0; i < retries; i++) {
     const res = await fetch('https://api.groq.com/openai/v1/chat/completions', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${GROQ_API_KEY}` },
       body: JSON.stringify({
-        model: 'llama-3.3-70b-versatile',
+        model: 'llama-3.1-8b-instant', // higher rate limits than 70b on free tier
         messages: [{ role: 'user', content: prompt }],
         temperature: 0.1,
-        max_tokens: 512,
+        max_tokens: 400,
       }),
     });
     if (res.status === 429) {
-      const wait = (i + 1) * 15000; // 15s, 30s, 45s
-      console.log(`  Rate limited, waiting ${wait/1000}s...`);
-      await sleep(wait);
+      const body = await res.text();
+      // Groq tells us exactly how long to wait, e.g. "try again in 5.415s"
+      let wait = (i + 1) * 8000;
+      const m = body.match(/try again in ([\d.]+)(ms|s)/);
+      if (m) wait = parseFloat(m[1]) * (m[2] === 's' ? 1000 : 1) + 1500;
+      console.log(`  Rate limited, waiting ${Math.round(wait)}ms...`);
+      await sleep(Math.min(wait, 65000));
       continue;
     }
     if (!res.ok) throw new Error(`Groq API failed: ${res.status} ${await res.text()}`);
@@ -69,9 +73,11 @@ async function groqWithRetry(prompt, retries = 3) {
 }
 
 async function analyseTicket(ticket, messages) {
-  const conversation = messages
-    .map(m => `[${m.is_responder ? 'AGENT' : 'CUSTOMER'}]: ${m.text}`)
+  let conversation = messages
+    .map(m => `[${m.is_responder ? 'AGENT' : 'CUSTOMER'}]: ${(m.text || '').slice(0, 600)}`)
     .join('\n');
+  // Cap total context to ~3000 chars (~750 tokens) to stay under Groq free-tier TPM
+  if (conversation.length > 3000) conversation = conversation.slice(0, 3000) + '\n...(truncated)';
 
   const prompt = `You are analysing a B2B SaaS support ticket for Peoplebox (an HR performance management platform). 
 
@@ -398,7 +404,8 @@ app.post('/ask', async (req, res) => {
       q += `&created_at=gte.${since}`;
     }
     if (type && type !== 'all') q += `&ticket_analysis.issue_type=eq.${type}`;
-    q += `&order=created_at.desc&limit=${Math.min(parseInt(limit) || 200, 400)}`;
+    // Cap at 120 tickets so a single Groq request stays under the free-tier token-per-minute limit
+    q += `&order=created_at.desc&limit=${Math.min(parseInt(limit) || 120, 120)}`;
 
     const rows = await supabase(q, 'GET');
     const tickets = (rows || []).map(t => ({
@@ -416,7 +423,7 @@ app.post('/ask', async (req, res) => {
     if (!tickets.length) return res.json({ answer: 'No analysed tickets match the current filters. Run analysis first or widen the filters.', count: 0 });
 
     const context = tickets.map(t =>
-      `CF-${t.id} [${t.type}|${t.collection}|${t.state}|urg${t.urgency}] ${t.title} :: ${t.summary} :: areas=${(t.areas||[]).join(',')} feats=${(t.features||[]).join(',')}`
+      `CF-${t.id} [${t.type}|${t.collection}|${t.state}|urg${t.urgency}] ${(t.title||'').slice(0,70)} :: ${(t.summary||'').slice(0,140)} :: areas=${(t.areas||[]).join(',')} feats=${(t.features||[]).slice(0,4).join(',')}`
     ).join('\n');
 
     const prompt = `You are a support-data analyst for Peoplebox (HR performance SaaS). Answer the user's question using ONLY the ticket data below. Be specific, cite ticket IDs (CF-xxxx) where relevant, and give counts/patterns. If asked for a list, return a clean list. Keep it concise.
