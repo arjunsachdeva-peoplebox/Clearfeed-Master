@@ -7,7 +7,7 @@ const PORT = process.env.PORT || 3000;
 const CLEARFEED_TOKEN = process.env.CLEARFEED_API_TOKEN;
 const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_SERVICE_KEY = process.env.SUPABASE_SERVICE_KEY;
-const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
+const GROQ_API_KEY = process.env.GROQ_API_KEY;
 
 app.use(cors({ origin: '*' }));
 app.use(express.json());
@@ -69,22 +69,24 @@ Respond with ONLY valid JSON (no markdown, no explanation):
   "key_tags": ["2-5 short descriptive tags for this ticket"]
 }`;
 
-  const res = await fetch(
-    `https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=${GEMINI_API_KEY}`,
-    {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        contents: [{ parts: [{ text: prompt }] }],
-        generationConfig: { temperature: 0.1, maxOutputTokens: 512 },
-      }),
-    }
-  );
+  const res = await fetch('https://api.groq.com/openai/v1/chat/completions', {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'Authorization': `Bearer ${GROQ_API_KEY}`,
+    },
+    body: JSON.stringify({
+      model: 'llama-3.3-70b-versatile',
+      messages: [{ role: 'user', content: prompt }],
+      temperature: 0.1,
+      max_tokens: 512,
+    }),
+  });
 
-  if (!res.ok) throw new Error(`Gemini API failed: ${res.status} ${await res.text()}`);
+  if (!res.ok) throw new Error(`Groq API failed: ${res.status} ${await res.text()}`);
   const data = await res.json();
-  const text = data.candidates?.[0]?.content?.parts?.[0]?.text || '{}';
-  const tokenCount = data.usageMetadata?.totalTokenCount || 0;
+  const text = data.choices?.[0]?.message?.content || '{}';
+  const tokenCount = data.usage?.total_tokens || 0;
 
   try {
     const cleaned = text.replace(/```json\n?/g, '').replace(/```\n?/g, '').trim();
