@@ -180,7 +180,7 @@ async function upsertMessages(ticketId, messages) {
     text: m.text || '',
     author_id: m.author || null,
     is_responder: m.is_responder || false,
-    ts: m.ts ? new Date(parseFloat(m.ts) * 1000).toISOString() : null,
+    ts: m.ts ? (() => { try { const d = new Date(parseFloat(m.ts) * 1000); return isNaN(d.getTime()) ? null : d.toISOString(); } catch { return null; } })() : null,
   }));
 
   // insert in batches of 50
