@@ -13,8 +13,10 @@ const GROQ_API_KEY = process.env.GROQ_API_KEY;
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
 const GEMINI_MODEL = process.env.GEMINI_MODEL || 'gemini-2.5-flash';
 const AI_PROVIDER = GEMINI_API_KEY ? 'gemini' : 'groq';
-// Pace between AI calls. Gemini free tier is ~10-15 RPM, so 6s is safe; Groq tolerates 4s.
-const AI_DELAY = GEMINI_API_KEY ? 6000 : 4000;
+// Pace between AI calls. This project's Gemini free-tier RPM limit is 5, so target ~4/min
+// = one call every 15s to stay safely under it (the per-minute 429 retry covers any
+// overshoot from request latency); Groq tolerates 4s.
+const AI_DELAY = GEMINI_API_KEY ? 15000 : 4000;
 
 app.use(cors({ origin: '*' }));
 app.use(express.json());
@@ -108,14 +110,15 @@ async function geminiComplete(prompt, { maxTokens = 400, json = false } = {}, re
     });
     if (res.status === 429 || res.status === 503) {
       const body = await res.text();
-      // A daily (requests/day) quota won't recover within this run — surface it so batch
-      // jobs can pause cleanly rather than burn minutes retrying every remaining ticket.
-      if (res.status === 429 && /per\s*day|perday|daily|PerDay/i.test(body)) {
+      const m = body.match(/"retryDelay":\s*"([\d.]+)s"/);
+      const retryDelay = m ? parseFloat(m[1]) : null;
+      // Per-minute throttling (RPM) and transient 503s come with a SHORT retry hint — just
+      // wait it out and retry. Only treat it as the DAILY cap (and pause the batch) when the
+      // per-day quota is named AND there's no short recovery (no/large retryDelay).
+      if (res.status === 429 && (retryDelay === null || retryDelay > 120) && /per\s*day|perday/i.test(body)) {
         throw new RateLimitError('Gemini daily quota (requests/day) exhausted');
       }
-      let wait = (i + 1) * 8000;
-      const m = body.match(/"retryDelay":\s*"([\d.]+)s"/);
-      if (m) wait = parseFloat(m[1]) * 1000 + 1500;
+      const wait = retryDelay != null ? retryDelay * 1000 + 1500 : (i + 1) * 8000;
       console.log(`  Gemini ${res.status}, waiting ${Math.round(wait)}ms...`);
       await sleep(Math.min(wait, 65000));
       continue;
