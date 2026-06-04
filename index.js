@@ -328,40 +328,110 @@ app.post('/sync', async (req, res) => {
   runSync({ daysBack: parseInt(days), skipAI }).catch(console.error);
 });
 
-// Analyse-only: process tickets that don't have AI analysis yet
+// Track whether an analysis run is already active (avoid duplicate parallel runs)
+let analyseRunning = false;
+
+// Analyse-only: process tickets that don't have AI analysis yet.
+// Uses the `unanalysed_tickets` view, so already-analysed tickets are
+// automatically skipped — no ticket is ever re-analysed (saves tokens).
 app.post('/analyse', async (req, res) => {
+  if (analyseRunning) {
+    return res.json({ message: 'Analysis already running', alreadyRunning: true });
+  }
+  analyseRunning = true;
   res.json({ message: 'AI analysis started in background' });
 
   (async () => {
     console.log('\n🤖 Starting AI analysis of unanalysed tickets...');
     let processed = 0;
-    let offset = 0;
-    const batchSize = 20;
 
-    while (true) {
-      // fetch unanalysed tickets with their messages
-      const tickets = await supabase(
-        `/tickets?select=id,title,state,priority,collection_name&id=not.in.(select ticket_id from ticket_analysis)&order=created_at.asc&limit=${batchSize}&offset=${offset}`,
-        'GET'
-      );
-      if (!tickets?.length) break;
+    try {
+      while (true) {
+        // The view only returns tickets WITHOUT analysis. As we analyse
+        // them they drop out of the view, so we always pull the next batch.
+        const tickets = await supabase(
+          `/unanalysed_tickets?select=id,title,state,priority,collection_name&order=created_at.asc&limit=20`,
+          'GET'
+        );
+        if (!tickets?.length) break;
 
-      for (const ticket of tickets) {
-        try {
-          const messages = await supabase(`/messages?ticket_id=eq.${ticket.id}&order=message_index.asc`, 'GET');
-          const { analysis, tokenCount } = await analyseTicket(ticket, messages || []);
-          await upsertAnalysis(ticket.id, analysis, tokenCount);
-          if (analysis) processed++;
-          if (processed % 10 === 0) console.log(`  🤖 ${processed} tickets analysed`);
-          await sleep(4000);
-        } catch (err) {
-          console.error(`  ❌ Analysis failed for ${ticket.id}: ${err.message}`);
+        for (const ticket of tickets) {
+          try {
+            const messages = await supabase(`/messages?ticket_id=eq.${ticket.id}&order=message_index.asc`, 'GET');
+            const { analysis, tokenCount } = await analyseTicket(ticket, messages || []);
+            await upsertAnalysis(ticket.id, analysis, tokenCount);
+            if (analysis) processed++;
+            if (processed % 10 === 0) console.log(`  🤖 ${processed} tickets analysed`);
+            await sleep(4000); // respect Groq 12K TPM free tier
+          } catch (err) {
+            console.error(`  ❌ Analysis failed for ${ticket.id}: ${err.message}`);
+            // If a ticket keeps failing it would loop forever (stays in view).
+            // Write a minimal placeholder so it leaves the view.
+            if (err.message.includes('after retries')) {
+              await upsertAnalysis(ticket.id, { issue_type: 'admin_action', summary: 'Auto-skipped (AI unavailable)', product_areas: [], features_mentioned: [], key_tags: [] }, 0);
+            }
+          }
         }
       }
-      offset += batchSize;
+      console.log(`\n✅ AI analysis complete. ${processed} tickets analysed this run.`);
+    } catch (err) {
+      console.error('Analysis run failed:', err.message);
+    } finally {
+      analyseRunning = false;
     }
-    console.log(`\n✅ AI analysis complete. ${processed} tickets analysed.`);
-  })().catch(console.error);
+  })().catch(e => { console.error(e); analyseRunning = false; });
+});
+
+// Ask a free-form question about the analysed data (uses Groq).
+// Pulls a compact representation of analysed tickets (optionally filtered)
+// and sends only that to Groq — keeps token usage low, no raw messages.
+app.post('/ask', async (req, res) => {
+  try {
+    const { question, collection = null, days = null, type = null, limit = 200 } = req.body || {};
+    if (!question) return res.status(400).json({ error: 'question is required' });
+
+    // Build filter for the joined query
+    let q = `/tickets?select=id,title,collection_name,state,priority,created_at,ticket_analysis!inner(issue_type,product_areas,features_mentioned,urgency_score,summary,sentiment)`;
+    if (collection && collection !== 'all') q += `&collection_name=eq.${encodeURIComponent(collection)}`;
+    if (days && days !== 'all') {
+      const since = new Date(Date.now() - parseInt(days) * 86400000).toISOString();
+      q += `&created_at=gte.${since}`;
+    }
+    if (type && type !== 'all') q += `&ticket_analysis.issue_type=eq.${type}`;
+    q += `&order=created_at.desc&limit=${Math.min(parseInt(limit) || 200, 400)}`;
+
+    const rows = await supabase(q, 'GET');
+    const tickets = (rows || []).map(t => ({
+      id: t.id,
+      title: (t.title || '').slice(0, 100),
+      collection: t.collection_name,
+      state: t.state,
+      type: t.ticket_analysis?.issue_type,
+      areas: t.ticket_analysis?.product_areas,
+      features: t.ticket_analysis?.features_mentioned,
+      urgency: t.ticket_analysis?.urgency_score,
+      summary: t.ticket_analysis?.summary,
+    }));
+
+    if (!tickets.length) return res.json({ answer: 'No analysed tickets match the current filters. Run analysis first or widen the filters.', count: 0 });
+
+    const context = tickets.map(t =>
+      `CF-${t.id} [${t.type}|${t.collection}|${t.state}|urg${t.urgency}] ${t.title} :: ${t.summary} :: areas=${(t.areas||[]).join(',')} feats=${(t.features||[]).join(',')}`
+    ).join('\n');
+
+    const prompt = `You are a support-data analyst for Peoplebox (HR performance SaaS). Answer the user's question using ONLY the ticket data below. Be specific, cite ticket IDs (CF-xxxx) where relevant, and give counts/patterns. If asked for a list, return a clean list. Keep it concise.
+
+QUESTION: ${question}
+
+TICKET DATA (${tickets.length} analysed tickets):
+${context}`;
+
+    const data = await groqWithRetry(prompt);
+    const answer = data.choices?.[0]?.message?.content || 'No answer generated.';
+    res.json({ answer, count: tickets.length, tokensUsed: data.usage?.total_tokens || 0 });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
 });
 
 // Sync status
