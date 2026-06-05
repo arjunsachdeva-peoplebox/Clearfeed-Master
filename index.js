@@ -8,16 +8,8 @@ const CLEARFEED_TOKEN = process.env.CLEARFEED_API_TOKEN;
 const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_SERVICE_KEY = process.env.SUPABASE_SERVICE_KEY;
 const GROQ_API_KEY = process.env.GROQ_API_KEY;
-// Provider DEFAULTS TO GROQ. To use Gemini instead, set BOTH `AI_PROVIDER=gemini` and
-// `GEMINI_API_KEY` on Railway. (Gemini's free-tier RPM on this project is only 5, which is
-// too slow for bulk analysis, so Groq is the default.)
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
 const GEMINI_MODEL = process.env.GEMINI_MODEL || 'gemini-2.5-flash';
-const USE_GEMINI = process.env.AI_PROVIDER === 'gemini' && !!GEMINI_API_KEY;
-const AI_PROVIDER = USE_GEMINI ? 'gemini' : 'groq';
-// Pace between AI calls. Groq: 4s (~15/min, no daily cap). Gemini free tier here is capped
-// at 5 RPM, so 15s (~4/min) when enabled.
-const AI_DELAY = USE_GEMINI ? 15000 : 4000;
 
 app.use(cors({ origin: '*' }));
 app.use(express.json());
@@ -88,7 +80,9 @@ async function groqComplete(prompt, { maxTokens = 400, json = false } = {}, retr
     const data = await res.json();
     return { text: data.choices?.[0]?.message?.content || '', tokenCount: data.usage?.total_tokens || 0 };
   }
-  throw new Error('Groq API failed after retries');
+  // Sustained 429s (e.g. Groq daily free-tier cap) — signal a clean pause so the batch
+  // stops and resumes after reset, instead of junking tickets with empty placeholders.
+  throw new RateLimitError('Groq rate-limited after retries');
 }
 
 async function geminiComplete(prompt, { maxTokens = 400, json = false } = {}, retries = 6) {
@@ -132,29 +126,59 @@ async function geminiComplete(prompt, { maxTokens = 400, json = false } = {}, re
   throw new RateLimitError('Gemini rate-limited after retries');
 }
 
-// Unified entry point. Uses Gemini only when explicitly enabled (USE_GEMINI), else Groq.
-// Falls back to Groq if a Gemini call fails and Groq is configured — UNLESS the caller
-// passes pauseOnRateLimit and the failure is a rate/quota limit, in which case the error
-// is propagated so a batch job can stop cleanly and resume after the quota resets.
+// ── PROVIDER REGISTRY ──
+// Each provider hides its own rate-limit/pacing presets (delay, context size). To add a
+// 3rd model later: add an entry here plus its *Complete() fn — the dashboard dropdown picks
+// it up automatically from GET /provider. `delay` is the spacing between calls (its rate
+// limit), `bigContext` decides whether full conversations are sent.
+const PROVIDERS = {
+  groq: {
+    id: 'groq', label: 'Groq · Llama 3.1 8B (fast, no daily cap)',
+    delay: 4000, bigContext: false, model: 'llama-3.1-8b-instant',
+    complete: groqComplete, available: () => !!GROQ_API_KEY,
+  },
+  gemini: {
+    id: 'gemini', label: 'Gemini 2.5 Flash (full context, ~4/min)',
+    delay: 15000, bigContext: true, model: GEMINI_MODEL,
+    complete: geminiComplete, available: () => !!GEMINI_API_KEY,
+  },
+};
+
+function defaultProvider() {
+  const envP = process.env.AI_PROVIDER;
+  if (envP && PROVIDERS[envP] && PROVIDERS[envP].available()) return envP;
+  if (PROVIDERS.groq.available()) return 'groq';
+  return Object.keys(PROVIDERS).find(k => PROVIDERS[k].available()) || 'groq';
+}
+
+// Runtime-selected provider (changeable via POST /provider). Resets to the env default on
+// restart. `aiDelay()` returns the active provider's preset pacing.
+let activeProvider = defaultProvider();
+const aiDelay = () => PROVIDERS[activeProvider]?.delay ?? 4000;
+
+// Unified entry point — routes to the active provider. For non-batch callers it falls back
+// to Groq if the active provider errors; batch callers pass pauseOnRateLimit so a rate/quota
+// limit propagates instead (letting the job pause cleanly and resume later).
 async function aiComplete(prompt, opts = {}) {
   const { pauseOnRateLimit = false, ...gen } = opts;
-  if (USE_GEMINI) {
-    try {
-      return await geminiComplete(prompt, gen);
-    } catch (e) {
-      if (e.rateLimited && pauseOnRateLimit) throw e;
-      if (!GROQ_API_KEY) throw e;
-      console.warn(`  Gemini failed (${e.message}); falling back to Groq.`);
+  const provider = PROVIDERS[activeProvider] || PROVIDERS.groq;
+  try {
+    return await provider.complete(prompt, gen);
+  } catch (e) {
+    if (e.rateLimited && pauseOnRateLimit) throw e;
+    if (activeProvider !== 'groq' && GROQ_API_KEY) {
+      console.warn(`  ${activeProvider} failed (${e.message}); falling back to Groq.`);
       return await groqComplete(prompt, gen);
     }
+    throw e;
   }
-  return await groqComplete(prompt, gen);
 }
 
 async function analyseTicket(ticket, messages, opts = {}) {
-  // Gemini's 1M context lets us send the full thread; Groq's tight TPM needs truncation.
-  const perMsg = USE_GEMINI ? 4000 : 600;
-  const maxConv = USE_GEMINI ? 30000 : 3000;
+  // Big-context providers (Gemini) get the full thread; tight-TPM ones (Groq) need truncation.
+  const big = PROVIDERS[activeProvider]?.bigContext;
+  const perMsg = big ? 4000 : 600;
+  const maxConv = big ? 30000 : 3000;
   let conversation = messages
     .map(m => `[${m.is_responder ? 'AGENT' : 'CUSTOMER'}]: ${(m.text || '').slice(0, perMsg)}`)
     .join('\n');
@@ -349,6 +373,7 @@ async function runSync(options = {}) {
     console.log(`\n📦 Total tickets to process: ${tickets.length}`);
 
     for (const ticket of tickets) {
+      if (stopRequested) { console.log('\n🛑 Sync stopped by request.'); break; }
       try {
         const messages = ticket.messages || [];
 
@@ -366,7 +391,7 @@ async function runSync(options = {}) {
           await upsertAnalysis(ticket.id, analysis, tokenCount);
           if (analysis) ticketsAnalysed++;
           totalTokens += tokenCount;
-          await sleep(AI_DELAY);
+          await sleep(aiDelay());
         }
 
         if (ticketsSynced % 10 === 0) {
@@ -399,9 +424,34 @@ async function runSync(options = {}) {
 // ── ROUTES ──
 app.get('/health', (req, res) => res.json({
   status: 'ok',
-  ai_provider: AI_PROVIDER,
-  model: AI_PROVIDER === 'gemini' ? GEMINI_MODEL : 'llama-3.1-8b-instant',
+  ai_provider: activeProvider,
+  model: PROVIDERS[activeProvider]?.model,
 }));
+
+// ── AI MODEL SELECTOR ──
+// Lists selectable models (rate-limit presets are hidden — each model just works) and the
+// currently active one. POST switches it at runtime. Resets to the env default on restart.
+app.get('/provider', (req, res) => res.json({
+  active: activeProvider,
+  providers: Object.values(PROVIDERS).map(p => ({ id: p.id, label: p.label, available: p.available() })),
+}));
+app.post('/provider', (req, res) => {
+  const { provider } = req.body || {};
+  if (!provider || !PROVIDERS[provider]) return res.status(400).json({ error: 'unknown provider' });
+  if (!PROVIDERS[provider].available()) return res.status(400).json({ error: `${provider} is not configured (missing API key on the server)` });
+  activeProvider = provider;
+  console.log(`AI provider switched to ${activeProvider}`);
+  res.json({ active: activeProvider, model: PROVIDERS[activeProvider].model });
+});
+
+// ── STOP CONTROL ──
+// Cooperative cancellation: background loops (sync / analyse / enrich / cluster) check this
+// flag between items and halt gracefully. Each run clears it at start.
+let stopRequested = false;
+app.post('/stop', (req, res) => {
+  stopRequested = true;
+  res.json({ message: 'Stop requested — background jobs will halt within a few seconds.' });
+});
 
 // Proxy routes (keep existing ones working)
 app.get('/tickets', async (req, res) => {
@@ -426,6 +476,7 @@ app.get('/tickets/:id', async (req, res) => {
 // Trigger full sync
 app.post('/sync', async (req, res) => {
   const { days = 180, skipAI = false } = req.body || {};
+  stopRequested = false;
   res.json({ message: 'Sync started in background', days });
   runSync({ daysBack: parseInt(days), skipAI }).catch(console.error);
 });
@@ -441,15 +492,18 @@ app.post('/analyse', async (req, res) => {
     return res.json({ message: 'Analysis already running', alreadyRunning: true });
   }
   analyseRunning = true;
+  stopRequested = false;
   res.json({ message: 'AI analysis started in background' });
 
   (async () => {
     console.log('\n🤖 Starting AI analysis of unanalysed tickets...');
     let processed = 0;
     let paused = false;
+    let stopped = false;
 
     try {
       while (true) {
+        if (stopRequested) { stopped = true; break; }
         // The view only returns tickets WITHOUT analysis. As we analyse
         // them they drop out of the view, so we always pull the next batch.
         const tickets = await supabase(
@@ -459,6 +513,7 @@ app.post('/analyse', async (req, res) => {
         if (!tickets?.length) break;
 
         for (const ticket of tickets) {
+          if (stopRequested) { stopped = true; break; }
           try {
             const messages = await supabase(`/messages?ticket_id=eq.${ticket.id}&order=message_index.asc`, 'GET');
             // pauseOnRateLimit: if Gemini's daily quota is hit, stop cleanly (no Groq fallback,
@@ -467,21 +522,23 @@ app.post('/analyse', async (req, res) => {
             await upsertAnalysis(ticket.id, analysis, tokenCount);
             if (analysis) processed++;
             if (processed % 10 === 0) console.log(`  🤖 ${processed} tickets analysed`);
-            await sleep(AI_DELAY); // pace AI calls for the active provider
+            await sleep(aiDelay()); // pace AI calls for the active provider
           } catch (err) {
+            // Rate/quota limit (e.g. Groq daily cap): PAUSE cleanly and resume after reset —
+            // do NOT junk the ticket, so it gets a real analysis later.
             if (err.rateLimited) { paused = true; break; }
+            // Any other persistent error (e.g. a 400 on a malformed ticket) would otherwise
+            // loop forever, so write a minimal placeholder to take it out of the queue.
             console.error(`  ❌ Analysis failed for ${ticket.id}: ${err.message}`);
-            // If a ticket keeps failing it would loop forever (stays in view).
-            // Write a minimal placeholder so it leaves the view.
-            if (err.message.includes('after retries')) {
-              await upsertAnalysis(ticket.id, { issue_type: 'admin_action', summary: 'Auto-skipped (AI unavailable)', product_areas: [], features_mentioned: [], key_tags: [] }, 0);
-            }
+            await upsertAnalysis(ticket.id, { issue_type: 'admin_action', summary: 'Auto-skipped (AI error)', product_areas: [], features_mentioned: [], key_tags: [] }, 0);
           }
         }
-        if (paused) break;
+        if (paused || stopped) break;
       }
-      if (paused) {
-        console.log(`\n⏸ Analysis paused after ${processed} tickets this run — Gemini daily quota reached. Click "Run Analysis" again after it resets (midnight US Pacific) to continue on Gemini.`);
+      if (stopped) {
+        console.log(`\n🛑 Analysis stopped by request after ${processed} tickets this run. Click "Run Analysis" to resume the remaining ones.`);
+      } else if (paused) {
+        console.log(`\n⏸ Analysis paused after ${processed} tickets this run — daily quota reached. Click "Run Analysis" again after it resets to continue.`);
       } else {
         console.log(`\n✅ AI analysis complete. ${processed} tickets analysed this run.`);
       }
@@ -554,13 +611,16 @@ let enrichRunning = false;
 app.post('/enrich-rca', async (req, res) => {
   if (enrichRunning) return res.json({ message: 'Enrichment already running', alreadyRunning: true });
   enrichRunning = true;
+  stopRequested = false;
   res.json({ message: 'Root-cause backfill started in background' });
 
   (async () => {
     console.log('\n🧩 Backfilling root-cause fields for already-analysed tickets...');
     let processed = 0;
+    let stopped = false;
     try {
       while (true) {
+        if (stopRequested) { stopped = true; break; }
         const rows = await supabase(
           `/tickets?select=id,title,collection_name,ticket_analysis!inner(summary,issue_type,product_areas,root_cause_category)&ticket_analysis.root_cause_category=is.null&limit=25`,
           'GET'
@@ -568,6 +628,7 @@ app.post('/enrich-rca', async (req, res) => {
         if (!rows?.length) break;
 
         for (const t of rows) {
+          if (stopRequested) { stopped = true; break; }
           const a = t.ticket_analysis || {};
           const prompt = `You are reducing future support tickets for Peoplebox (HR performance SaaS). For the ticket below, decide what would have PREVENTED it.
 Title: ${(t.title || '').slice(0, 160)}
@@ -591,15 +652,17 @@ Respond with ONLY valid JSON:
             });
             processed++;
             if (processed % 10 === 0) console.log(`  🧩 ${processed} tickets enriched`);
-            await sleep(AI_DELAY);
+            await sleep(aiDelay());
           } catch (err) {
             console.error(`  ❌ Enrich failed for ${t.id}: ${err.message}`);
             // Mark as 'other' so it leaves the IS NULL set and we don't loop forever.
             await supabase(`/ticket_analysis?ticket_id=eq.${t.id}`, 'PATCH', { root_cause_category: 'other' });
           }
         }
+        if (stopped) break;
       }
-      console.log(`\n✅ Root-cause backfill complete. ${processed} tickets enriched this run.`);
+      if (stopped) console.log(`\n🛑 Root-cause backfill stopped by request after ${processed} tickets.`);
+      else console.log(`\n✅ Root-cause backfill complete. ${processed} tickets enriched this run.`);
     } catch (err) {
       console.error('Enrichment run failed:', err.message);
     } finally {
@@ -618,6 +681,7 @@ let clusterRunning = false;
 app.post('/cluster', async (req, res) => {
   if (clusterRunning) return res.json({ message: 'Clustering already running', alreadyRunning: true });
   clusterRunning = true;
+  stopRequested = false;
   res.json({ message: 'Clustering started in background' });
 
   (async () => {
@@ -671,6 +735,7 @@ Respond with ONLY a valid JSON array (no markdown):
       // ── PASS B: assign every analysed ticket without a cluster_id ──
       let assigned = 0;
       while (true) {
+        if (stopRequested) { console.log('\n🛑 Clustering stopped by request during assignment.'); break; }
         const batch = await supabase(
           `/tickets?select=id,title,ticket_analysis!inner(summary,issue_type,cluster_id)&ticket_analysis.cluster_id=is.null&order=created_at.desc&limit=15`,
           'GET'
@@ -708,7 +773,7 @@ Respond with ONLY a valid JSON object mapping ticket id (without the CF- prefix)
           assigned++;
         }
         if (assigned % 30 === 0) console.log(`  🧭 ${assigned} tickets assigned`);
-        await sleep(AI_DELAY);
+        await sleep(aiDelay());
       }
       console.log(`\n✅ Clustering complete. ${clusterRows.length} clusters, ${assigned} tickets assigned.`);
     } catch (err) {
@@ -729,4 +794,4 @@ app.get('/sync/status', async (req, res) => {
   }
 });
 
-app.listen(PORT, () => console.log(`ClearFeed sync service running on port ${PORT} · AI provider: ${AI_PROVIDER}${AI_PROVIDER === 'gemini' ? ' (' + GEMINI_MODEL + ')' : ''}`));
+app.listen(PORT, () => console.log(`ClearFeed sync service running on port ${PORT} · AI provider: ${activeProvider} (${PROVIDERS[activeProvider]?.model})`));
